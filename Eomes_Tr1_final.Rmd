@@ -1,0 +1,528 @@
+---
+title: "Tr1 single cell"
+author: "OW"
+date: "5/17/22"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r, warning=FALSE, message=FALSE, warning=FALSE, echo=F}
+#devtools::install_github('scfurl/m3addon')
+rm(list=ls())
+knitr::opts_chunk$set(fig.width=8, fig.height=6,
+                      echo=FALSE, warning=FALSE, message=FALSE)
+knitr::opts_chunk$set(dev.args=list(bg="transparent"))
+ROOT_DIR<-"/fh/fast/furlan_s/experiments/Ping_Eomes"
+DATA_DIR <- file.path(ROOT_DIR, "data")      # SPECIFY HERE
+RES_DIR  <- file.path(ROOT_DIR,"res")     # SPECIFY HERE
+RMD_DIR  <- file.path(ROOT_DIR,"rmd")     # SPECIFY HERE
+CDS_DIR <- file.path(ROOT_DIR,"cds")
+FIG_DIR <- file.path(ROOT_DIR,"figs")
+# ENR_DIR<-file.path(ROOT_DIR, "Bioinformatics Resources", "MSigDB")
+# SCRIPT_DIR<-file.path(ROOT_DIR, "develop", "SfScripts", "m3")
+
+suppressPackageStartupMessages({
+  library(monocle3)
+  library(m3addon)
+  library(reticulate)
+  library(openxlsx)  
+  library(dplyr)
+  library(Matrix)
+  library(ggplot2)
+  #library(rhdf5)
+  library(hdf5r)
+  library(xfun)
+  library(pals)
+  library(RColorBrewer)
+  #library(knitr)
+  library(Seurat)
+  library(ComplexHeatmap)
+  library(stringr)
+  library(scCustomize)
+  library(ArchR)
+  library(msigdbr)
+})
+
+set.seed(1234)
+
+dyn.load('/app/software/ArrayFire/3.8.1/lib64/libaf.so.3')
+library(RcppArrayFire)
+library(viewmastR)
+
+plan("multisession", workers = 12)
+options(future.globals.maxSize = 60000000 * 1024^2)
+```
+
+#load final data
+```{r}
+seu<-readRDS(file.path(CDS_DIR, "210223_seurat.rds"))
+cluster_cols <- viewmaster::pal_discrete(values = levels(factor(seu$clusters)), set = "springTime")
+h_cols <-rev(brewer.pal(name = "RdYlBu", n = 7))
+rna_cols<-paletteContinuous(n=8)[c(1:3, 6:8)]
+```
+
+#Build object
+
+##First Pass
+```{r}
+dirs<-list.files(DATA_DIR, full.name=T)[grep("^P[1-4]", list.files(DATA_DIR))]
+files<-file.path(dirs, "outs", "filtered_feature_bc_matrix.h5")
+
+seus<-lapply(files, function(i) Read10X_h5(i))
+seuG <- lapply(seus, function(i) CreateSeuratObject(i))
+
+seu <- merge(
+  x = seuG[[1]],
+  y = seuG[2:length(seuG)], add.cell.ids = basename(dirs)
+)
+
+seu$group<-strsplit(rownames(seu@meta.data), "_") %>% sapply("[[", 1)
+seu<-seu[,!seu$group %in% "P1"]
+seu[["percent.mt"]] <- PercentageFeatureSet(seu, pattern = "^mt-")
+seu$logUMI<-log10(seu$nCount_RNA)
+VlnPlot(seu, features = c("nFeature_RNA", "nCount_RNA", "logUMI", "percent.mt"), ncol = 4, pt.size = 0)
+
+
+lthresh<-500
+hthresh<-50000
+seu<-seu[,seu$nCount_RNA>lthresh]
+seu<-seu[,seu$nCount_RNA<hthresh]
+seu<-seu[,seu$percent.mt<5]
+
+seu <- NormalizeData(seu, normalization.method = "LogNormalize", scale.factor = 10000)
+seu <- FindVariableFeatures(seu, selection.method = "vst", nfeatures = 5000)
+seu <- ScaleData(seu)
+seu <- RunPCA(seu, features = VariableFeatures(object = seu), npcs = 50)
+ElbowPlot(seu, 50)
+seu <- FindNeighbors(seu, dims = 1:40)
+seu <- FindClusters(seu, resolution = 0.4)
+seu <- RunUMAP(seu, dims = 1:40, min.dist = 0.05)
+DimPlot(seu)
+```
+
+
+## RE-EMBED
+```{r remove satellite cells & re-embed}
+#one cluster is myeloid, the other does not cluster cleanly--kinda sus and there are very few cells
+
+seu<-readRDS(file.path(CDS_DIR, "220414_cds.RDS"))
+
+FeaturePlot(seu, features = c("Itgam","Cd14", "Mrc1"), order = T, pt.size = 1)
+
+cells<-CellSelector(DimPlot(seu, group.by = "celltype"))
+seu<-seu[,cells]
+
+DefaultAssay(seu) <- "RNA"
+# perform visualization and clustering steps
+seu <- SCTransform(seu, verbose = T, vars.to.regress = "percent.mt")
+# These are now standard steps in the Seurat workflow for visualization and clustering
+seu <- RunPCA(seu, verbose = FALSE)
+ElbowPlot(seu)
+DefaultAssay(seu)<-"SCT"
+seu <- RunUMAP(seu, dims = 1:20, verbose = FALSE)
+seu <- FindNeighbors(seu, dims = 1:20, verbose = FALSE)
+seu<-FindClusters(seu, resolution = 0.335, algorithm = 2, random.seed = 1234)
+
+DimPlot(seu)
+
+#collapse 6 & 4
+#collapse 5 & 3
+
+seu$clusters<-seu$seurat_clusters
+seu$clusters[seu$seurat_clusters %in% c(6,4)]<-4
+seu$clusters[seu$seurat_clusters %in% c(5,3)]<-3
+seu$clusters[seu$seurat_clusters %in% c(7)]<-5
+seu$clusters[seu$seurat_clusters %in% c(8)]<-6
+
+mat<-table(seu$clusters, seu$celltype) %>% as.matrix()
+Heatmap(mat)
+```
+
+```{r re-assign levels}
+seu$sortgate<-factor(seu$sortgate, levels = c("dn", "eomes_sp", "dp"))
+```
+
+# DIM PLOT
+```{r dim plot}
+pdf("../figs/clusters_umap.pdf", width = 5, height = 5)
+DimPlot(seu, group.by = "clusters", pt.size = 1, cols = cluster_cols)&NoAxes()
+dev.off()
+
+pdf("../figs/sortgate_umap_split.pdf", width = 8, height = 5)
+DimPlot(seu, group.by = "sortgate", cols = sfc(3), pt.size = 1, split.by = "sortgate")&NoAxes()
+dev.off()
+
+pdf("../figs/sortgate_umap.pdf", width = 5, height = 5)
+DimPlot(seu, group.by = "sortgate", cols = sfc(3), pt.size = 1)&NoAxes()
+dev.off()
+```
+
+# DE GENES
+```{r DE genes}
+Idents(seu)<-"clusters"
+markers<-FindAllMarkers(seu, only.pos = F)
+write.csv(markers, file.path(RES_DIR, "cluster_DE_genes.csv"))
+
+top_n<-markers %>%
+  group_by(cluster) %>%
+  slice_max(avg_log2FC, n =10)
+pdf("../figs/top10_genes_heatmap.pdf", width = 7, height = 8)
+DoHeatmap(seu, features = top_n$gene, group.by = "clusters", group.colors = cluster_cols)+scale_fill_gradientn(colours = h_cols)
+dev.off()
+```
+
+# DOT PLOT
+```{r Dot Plot}
+genes<-c("Eomes", "Il10", "Prf1", "Nkg7", "Gzma", "Gzmb", "Gzmk", "Ifng", "Ccl3", "Ccl4", "Ccl5", "Cd226","Cxcr6","Tnfrsf4","Tnfrsf9", "Icos", "Entpd1", "Lag3", "Pdcd1", "Tigit", "Havcr2", "Cd44", "Sell", "Slamf6", "Cxcr5", "Cx3cr1", "Ccr2", "Ccr7", "Il7r", "Il18r1", "Tcf7", "Id2", "Id3", "Bcl2", "Tox", "Nr4a2","Mki67", "Isg15")
+
+seu$clusters<-factor(seu$clusters, levels = rev(levels(factor(seu$clusters))))
+
+pdf("../figs/dot_plot_clusters.pdf", width = 8.5, height = 6)
+SCpubr::do_DotPlot(seu, features = genes, cluster.idents = F, group.by = "clusters")+scale_fill_gradientn(colours = h_cols)
+dev.off()
+
+pdf("../figs/dot_plot_sortgate.pdf", width = 8, height = 4)
+SCpubr::do_DotPlot(seu, features = genes, cluster.idents = T, group.by = "sortgate")+scale_fill_gradientn(colours = h_cols)
+dev.off()
+```
+
+# FEATURE PLOT
+```{r}
+FeaturePlot(seu, features = "Foxp3")
+```
+
+# CELLULARITY
+```{r cellularity bar plot}
+df<- data.frame(table(seu$clusters, seu$sortgate))
+
+df$Var2<-factor(df$Var2, levels = c("dn", "eomes_sp", "dp"))
+
+pdf("../figs/bar_plot_clusters_sortgate.pdf", width =3, height =4)
+ggplot(df, aes(fill = Var1, y=Freq, x=Var2)) + 
+    geom_bar(stat = "identity",  position = "fill")+scale_fill_manual(values = cluster_cols)+theme_classic()+RotatedAxis()+NoGrid()
+dev.off()
+```
+
+# GENE SET SCORES
+```{r EnrichR, unsupervised}
+# Set necessary enrichR global options. This is copied from EnrichR code to avoid having to load the package.
+suppressMessages({
+  options(enrichR.base.address = "https://maayanlab.cloud/Enrichr/")
+  options(enrichR.live = TRUE)
+  options(modEnrichR.use = TRUE)
+  options(enrichR.sites.base.address = "https://maayanlab.cloud/")
+  options(enrichR.sites = c("Enrichr", "FlyEnrichr", "WormEnrichr", "YeastEnrichr", "FishEnrichr"))
+
+  # Set the search to Human genes.
+  enrichR::setEnrichrSite(site = "Enrichr")
+
+  websiteLive <- TRUE
+  dbs <- enrichR::listEnrichrDbs()
+  # Get all the possible databases to query.
+  dbs <- sort(dbs$libraryName)
+})
+
+# Choose the dataset to query against.
+dbs_use <- c("GO_Biological_Process_2021", 
+             "GO_Cellular_Component_2021", 
+              "MSigDB_Hallmark_2020",
+             "KEGG_2019_Mouse","WikiPathways_2019_Mouse" 
+             )
+# List of genes to use as input.
+markers<-read.csv("../res/cluster_DE_genes.csv")
+names(markers)
+
+lapply(levels(factor(markers$cluster)), function(x){
+  sub<-markers[markers$cluster == x,] %>% slice_max(avg_log2FC, n = 100)
+  enriched_terms <- enrichR::enrichr(sub$gene, dbs_use)
+  idx<-as.numeric(x)
+  p <- SCpubr::do_TermEnrichmentPlot(enriched_terms = enriched_terms, nterms = 10, colors.use = c( cluster_cols[names(cluster_cols) == idx], "gray90") , legend.length = 10)
+  lapply(dbs_use, function(i){
+    pdf(paste0("../figs/cluster", x, "_",i, "_gsea.pdf"), width =15, height = 10)
+    print(p[[i]])
+    dev.off()
+    
+  })
+})
+```
+
+```{r load Pings curated gene sets}
+p<-read.xlsx("../gene_sets/GSEA_Pathways_OW.xlsx")
+plist<-as.list(p)
+plist<-lapply(plist, function(v) v[!is.na(v)])
+#plist<-lapply(plist, function(v) stringr::str_to_title(v) )
+
+humanToMouse<-function(x){
+dat<-data.table::fread("/fh/fast/furlan_s/grp/refs/human_mouse/human_mouse.txt")
+f<-x[x %in% dat$V1]
+dat$V3[match(x[x %in% dat$V1], dat$V1)]}
+
+for(i in c(1,2,4)){
+  plist[[i]]<-humanToMouse(plist[[i]])
+}
+
+seu <- AddModuleScore(object = seu, features = plist, name = "PW")
+colnames(seu@meta.data)[grep("^PW", colnames(seu@meta.data))]<-names(plist)
+```
+
+```{r load Pings curated gene sets}
+#compare dn to sp, dn to dp
+
+pdf("../figs/EOMES+Treg_cluster.pdf", width = 4, height = 4)
+VlnPlot(seu, features = names(plist)[2], pt.size = 0)+scale_fill_manual(values=cluster_cols)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")&NoLegend()
+dev.off()
+
+pdf("../figs/EOMES+Treg_sortgate.pdf", width = 4, height = 4)
+VlnPlot(seu, features = names(plist)[2], pt.size = 0, group.by = "sortgate")+scale_fill_manual(values=sfc(3))+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")&NoLegend()
+dev.off()
+
+pdf("../figs/Exh_Eff_cluster.pdf", width = 4, height = 4)
+VlnPlot(seu, features = names(plist)[3], pt.size = 0)+scale_fill_manual(values=cluster_cols)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")&NoLegend()
+dev.off()
+
+pdf("../figs/Exh_Eff_sortgate.pdf", width = 4, height = 4)
+VlnPlot(seu, features = names(plist)[3], pt.size = 0, group.by = "sortgate")+scale_fill_manual(values=sfc(3))+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")&NoLegend()
+dev.off()
+
+pdf("../figs/CD4_CTL_cluster.pdf", width = 4, height = 4)
+VlnPlot(seu, features = names(plist)[4], pt.size = 0)+scale_fill_manual(values=cluster_cols)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")&NoLegend()
+dev.off()
+
+my_comparisons <- list( c("dn", "eomes_sp"), c("dn", "dp"), c("eomes_sp", "dp")) 
+
+pdf("../figs/CD4_CTL_sortgate.pdf", width = 4, height = 4)
+VlnPlot(seu, features = names(plist)[4], pt.size = 0,  group.by = "sortgate")+scale_fill_manual(values=sfc(3))+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")&NoLegend()
+dev.off()
+```
+
+```{r load gene sets}
+stem<-read.csv(file.path("../../Ping/data/gene_sets/stem-like_genes.csv"))
+tex<-read.csv(file.path("../../Ping/data/gene_sets/Tex_markers_shietinger.csv" ))
+
+msig<-msigdbr(species = "Mus musculus", category = "H")
+glyco<-msig[msig$gs_name == "HALLMARK_GLYCOLYSIS",]$gene_symbol
+
+msig<-msigdbr(species = "Mus musculus", category = "H")
+oxphos<-msig[msig$gs_name == "HALLMARK_OXIDATIVE_PHOSPHORYLATION",]$gene_symbol
+
+msig<-msigdbr(species = "Mus musculus", category = "H")
+ifng<-msig[msig$gs_name == "HALLMARK_INTERFERON_GAMMA_RESPONSE",]$gene_symbol
+
+msig<-msigdbr(species = "Mus musculus", subcategory = "GO:BP")
+ifng<-msig[msig$gs_name == "HALLMARK_INTERFERON_GAMMA_RESPONSE",]$gene_symbol
+
+msig<-msigdbr(species = "Mus musculus", subcategory = "GO:BP")
+ifng<-msig[msig$gs_name == "HALLMARK_INTERFERON_GAMMA_RESPONSE",]$gene_symbol
+
+msig<-msigdbr(species = "Mus musculus", subcategory = "GO:MF")
+chemo_bind<-msig[msig$gs_name == "GOMF_C_C_CHEMOKINE_BINDING",]$gene_symbol
+
+msig<-msigdbr(species = "Mus musculus", subcategory = "GO:MF")
+chemo_act<-msig[msig$gs_name == "GOMF_CHEMOKINE_ACTIVITY",]$gene_symbol
+```
+
+```{r add module score}
+DefaultAssay(seu)<-"RNA"
+seu<-AddModuleScore(seu, features = list(stem$Gene), name = "Stem_like")
+seu<-AddModuleScore(seu, features = list(tex$Gene), name = "Tex")
+seu<-AddModuleScore(seu, features = list(glyco), name = "Glyco")
+seu<-AddModuleScore(seu, features = list(oxphos), name = "Oxphos")
+seu<-AddModuleScore(seu, features = list(ifng), name = "Ifng_response")
+seu<-AddModuleScore(seu, features = list(chemo_bind), name = "chemo_bind")
+seu<-AddModuleScore(seu, features = list(chemo_act), name = "chemo_act")
+```
+
+```{r}
+saveRDS(seu, "../cds/210223_seurat.rds")
+```
+
+```{r glyco by sortgate}
+pdf("figs/glycolysis_sortgate.pdf", width = 3, height =3)
+VlnPlot(seu, features = "Glyco1", group.by = "sortgate", cols = sfc(3), pt.size =0)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")&NoLegend()
+dev.off()
+```
+
+```{r glyco by cluster}
+pdf("../figs/glycolysis_cluster.pdf", width = 3, height =3)
+VlnPlot(seu, features = "Glyco1", group.by = "clusters", cols = cluster_cols, pt.size =0)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")&NoLegend()
+dev.off()
+```
+
+```{r oxphos by sortgate}
+pdf("figs/oxphos_sortgate.pdf", width = 3, height =3)
+VlnPlot(seu, features = "Oxphos1", group.by = "sortgate", cols = sfc(3), pt.size =0)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")&NoLegend()
+dev.off()
+```
+
+```{r oxphos by cluster}
+pdf("../figs/oxphos_cluster.pdf", width = 3, height =3)
+VlnPlot(seu, features = "Oxphos1", group.by = "clusters", cols = cluster_cols, pt.size =0)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")&NoLegend()
+dev.off()
+```
+
+```{r Tex by sortgate}
+pdf("../figs/Tex_sortgate.pdf", width = 3, height =3)
+VlnPlot(seu, features = "Tex1", group.by = "sortgate", cols = sfc(3), pt.size =0)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")&NoLegend()
+dev.off()
+```
+
+```{r Tex by cluster}
+pdf("../figs/Tex_cluster.pdf", width = 3, height =3)
+VlnPlot(seu, features = "Tex1", group.by = "clusters", cols = cluster_cols, pt.size =0)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")&NoLegend()
+dev.off()
+```
+
+```{r ifng by cluster}
+pdf("../figs/Ifng_response_cluster.pdf", width = 3, height =3)
+VlnPlot(seu, features = "Ifng_response1", group.by = "clusters", cols = cluster_cols, pt.size =0)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")&NoLegend()
+dev.off()
+```
+
+```{r chemo bind by sortgate}
+pdf("../figs/chemo_bind_sortgate.pdf", width = 3, height =3)
+VlnPlot(seu, features = "chemo_bind1", group.by = "sortgate", cols = sfc(3), pt.size =0)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")&NoLegend()
+dev.off()
+```
+
+```{r chemo bind cluster}
+pdf("../figs/chemo_bind_cluster.pdf", width = 3, height =3)
+VlnPlot(seu, features = "chemo_bind1", group.by = "clusters", cols = cluster_cols, pt.size =0)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")&NoLegend()
+dev.off()
+```
+
+```{r chemo act by sortgate}
+pdf("../figs/chemo_act_sortgate.pdf", width = 3, height =3)
+VlnPlot(seu, features = "chemo_act1", group.by = "sortgate", cols = sfc(3), pt.size =0)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")&NoLegend()
+dev.off()
+```
+
+```{r chemo bind cluster}
+pdf("../figs/chemo_act_cluster.pdf", width = 3, height =3)
+VlnPlot(seu, features = "chemo_act1", group.by = "clusters", cols = cluster_cols, pt.size =0)+geom_boxplot(width = 0.25, notch = FALSE, notchwidth = .4, outlier.shape = NA, coef=0, fill = "white")&NoLegend()
+dev.off()
+```
+### Appendix
+```{r Appendix,echo=FALSE}
+sessionInfo()
+getwd()
+```
+
+# PSEUDOTIME
+```{r}
+cds<-viewmastR::seurat_to_monocle3(seu)
+
+cds@int_colData@listData[["reducedDims"]]@listData<-cds@int_colData@listData[["reducedDims"]]@listData[1]
+
+plot_cells(cds, genes = c("Sell", "Lef1"), scale_to_range = F)
+cds<-cluster_cells(cds, resolution = 0.001)
+plot_cells(cds)
+
+cds@clusters@listData[["UMAP"]][["clusters"]]<-clusters(cds)
+cds<-learn_graph(cds, use_partition = T, close_loop = T)
+cds<- order_cells(cds)
+plot_cells(cds, color_cells_by = "pseudotime", show_trajectory_graph = F)
+
+seu$pseudotime<-pseudotime(cds)
+pdf("../figs/pseudotime_umap.pdf", width = 4, height =4)
+FeaturePlot(seu, features = "pseudotime")+scale_color_gradientn(colors = viridis::plasma(n=10))&NoAxes()
+dev.off()
+
+pseudo_genes <- c(  "Eomes", "Il10", "Ifng", "Prf1", "Gzma", "Tcf7" ,"Tox",
+                           "Id2", "Cd226", "Cd44", "Cxcr6", "Tigit", "Pdcd1", "Lag3", 
+                           "Entpd1", "Ccr2", "Ccr7", "Cx3cr1", "Il7r","Il18r1", "Tbx21", "Bhlhe40")
+
+pseudo_cds <- cds[rowData(cds)$gene_short_name %in% pseudo_genes,]
+pdf("../figs/genes_pseudotime.pdf", width = 4, height =10)
+plot_genes_in_pseudotime(pseudo_cds,
+                         color_cells_by="clusters",
+                         min_expr=0.5, cell_size = 1, ncol = 2)+scale_color_manual(values = alpha(cluster_cols, 0.5))
+dev.off()
+```
+
+
+# RNA Velocity
+```{r prepare cds}
+cds<-seurat_to_monocle3(seu)
+exprs <- t(assay(cds))
+col_data <- as.data.frame(colData(cds))
+row_data <- as.data.frame(rowData(cds))
+embedding <- reducedDim(cds, "UMAP")
+
+cb<-strsplit(rownames(col_data), "\\_") %>% sapply("[[", 2) %>% strsplit("-") %>% sapply("[[", 1)
+id<-strsplit(rownames(col_data), "\\_") %>% sapply("[[", 1) %>% strsplit("P") %>% sapply("[[",2)
+rownames(col_data)<-paste0(cb, "-",id)
+rownames(exprs)<-rownames(col_data)
+
+Sys.setenv(RETICULATE_PYTHON = "~/.conda/envs/py3/bin/python3")
+Sys.getenv()
+
+library("reticulate")
+use_python("~/.conda/envs/py3/bin/python3")
+use_condaenv("~/.conda/envs/py3")
+matplotlib <- import("matplotlib")
+matplotlib$use("Agg", force = TRUE)
+```
+
+```{python}
+import scanpy as sc
+
+adata_sce = sc.AnnData(X = r.exprs, obs = r.col_data, var = r.row_data)
+adata_sce.obsm['umap'] = r.embedding
+
+import scvelo as scv
+import matplotlib
+import os
+scv.set_figure_params()
+filename = os.path.join("/fh/fast/furlan_s/experiments/Ping_Eomes/data/P2/velocyto/P2.loom")
+ldata = scv.read(filename, cache=True)
+ldata.var_names_make_unique()
+ldata.obs.index=ldata.obs.index.str.replace("P2:", "").str.replace("x", "-2")
+filename = os.path.join("/fh/fast/furlan_s/experiments/Ping_Eomes/data/P3/velocyto/P3.loom")
+ldata2 = scv.read(filename, cache=True)
+ldata2.var_names_make_unique()
+ldata2.obs.index=ldata2.obs.index.str.replace("P3:", "").str.replace("x", "-3")
+filename = os.path.join("/fh/fast/furlan_s/experiments/Ping_Eomes/data/P4/velocyto/P4.loom")
+ldata3 = scv.read(filename, cache=True)
+ldata3.var_names_make_unique()
+ldata3.obs.index=ldata3.obs.index.str.replace("P4:", "").str.replace("x", "-4")
+
+ldataC=ldata.concatenate(ldata, ldata2, ldata3, join='inner', index_unique=None)
+
+ldataC.obs_names_make_unique()
+
+adata=ldataC[adata_sce.obs.index].copy()
+adata.obsm['umap']=adata_sce.obsm['umap']
+adata.obs['seurat_clusters']=adata_sce.obs['seurat_clusters']
+scv.pp.filter_and_normalize(adata)
+scv.pp.moments(adata)
+scv.tl.velocity(adata, mode='stochastic')
+scv.tl.velocity_graph(adata)
+export DISPLAY=unix$DISPLAY
+scv.pl.velocity_embedding_stream(adata, basis='umap', color="seurat_clusters", save= "/fh/fast/furlan_s/experiments/Ping_Eomes/figs/cd4_velo.pdf", smooth=0.4, min_mass=0, alpha=1, palette=r.cluster_cols, legend_loc='none', arrow_size =1, show = False, size = 7)
+```
+
+# FATTY ACIDS
+```{r}
+# In ZP’s sequencing dataset, could we look to see if there is:
+# Specifically more expression of the SCFA receptors GPR43 and 109a in the Tr1’s
+# If there are other metabolic signatures (more vague I know) related to fatty acid metabolism for e.g. that would give me a potential mechanism to hang on to for the SCFA  Tr1 link.
+DefaultAssay(seu)<-"RNA"
+FeaturePlot_scCustom(seu, features = c('Ffar2', 'Ffar1', 'Ffar3', 'Ffar4'),pt.size = 1, colors_use = rna_cols )&NoAxes()
+
+FeaturePlot_scCustom(seu, features = c('Hcar2'),pt.size = 1, colors_use = rna_cols )&NoAxes()
+
+
+msig<-msigdbr(species = "Mus musculus", category = "H")
+msig$gs_name[grep("ACID", msig$gs_name)]
+fam<-msig[msig$gs_name == "HALLMARK_FATTY_ACID_METABOLISM",]$gene_symbol
+
+DefaultAssay(seu)<-"RNA"
+seu<-AddModuleScore(seu, features = list(fam), name = "fam")
+FeaturePlot_scCustom(seu, features = 'fam1', colors_use = rna_cols , pt.size = 0.7, max.cutoff = "q95")
+VlnPlot(seu, features = 'fam1', cols = cluster_cols, group.by = 'clusters')+ggtitle(label = "Hallmark fatty acid metabolism")
+```
+
